@@ -29,3 +29,226 @@ index 500141a..49b3abd 100644
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+diff --git a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
+index fe7bf48..357622b 100644
+--- a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
++++ b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
+@@ -3,10 +3,11 @@
+ 
+ #import "OnnxruntimeModule.h"
+ #import "TensorHelper.h"
+-
+ #import <Foundation/Foundation.h>
+ #import <React/RCTLog.h>
+ #import <onnxruntime/onnxruntime_cxx_api.h>
++#import <jsi/jsi.h>
++#import <React/RCTBridge+Private.h>
+ 
+ @implementation OnnxruntimeModule
+ 
+@@ -276,4 +277,69 @@ - (void)dealloc {
+   }
+ }
+ 
++RCT_EXPORT_BLOCKING_SYNCHRONOUS_METHOD(install)
++{
++  NSLog(@"Installing ONNXRuntime Bindings...");
++  RCTBridge* bridge = [RCTBridge currentBridge];
++  RCTCxxBridge* cxxBridge = (RCTCxxBridge*)bridge;
++  if (cxxBridge == nil) {
++    return @false;
++  }
++
++  using namespace facebook;
++  
++  auto jsiRuntime = (jsi::Runtime*) cxxBridge.runtime;
++  if (jsiRuntime == nil) {
++    return @false;
++  }
++
++  auto& runtime = *jsiRuntime;
++
++  auto onnxInferenceRun = jsi::Function::createFromHostFunction(runtime,
++    jsi::PropNameID::forAscii(runtime, "onnxInferenceRun"),
++    1,
++    [](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* args, size_t count) -> jsi::Value {
++      if (count != 1) {
++        throw jsi::JSError(runtime, "onnxInferenceRun: Invalid number of args");
++      }
++
++      auto url = args[0].getString(runtime).utf8(runtime);
++      auto input = args[1].asObject(runtime);
++      auto output = args[2].asObject(runtime);
++      auto options = args[3].asObject(runtime);
++
++      NSString *urlString = [NSString stringWithUTF8String:url.c_str()];
++      NSValue *value = [sessionMap objectForKey:urlString];
++      if (value == nil) {
++        NSException *exception = [NSException exceptionWithName:@"onnxruntime"
++                                                        reason:@"can't find onnxruntime session"
++                                                      userInfo:nil];
++        @throw exception;
++      }
++      SessionInfo *sessionInfo = (SessionInfo *)[value pointerValue];
++
++      std::vector<Ort::Value> feeds;
++      std::vector<Ort::MemoryAllocation> allocations;
++      feeds.reserve(sessionInfo->inputNames.size());
++      for (auto inputName : sessionInfo->inputNames) {
++        auto inputTensor = input.getProperty(runtime, inputName).asObject(runtime);
++        // TODO: check inputTensor exists
++
++        Ort::Value value = [TensorHelper createInputTensorJSI:runtime input:&inputTensor ortAllocator:ortAllocator allocations:allocations];
++        feeds.emplace_back(std::move(value));
++      }
++
++      // NSDictionary *inputDict = [NSDictionary dictionaryWithDictionary:input];
++      // NSArray *outputArray = [NSArray arrayWithArray:output];
++      // NSDictionary *optionsDict = [NSDictionary dictionaryWithDictionary:options];
++
++      jsi::Object result(runtime);
++      return result;
++    }
++  );
++
++  NSLog(@"Installed ONNXRuntime Bindings!");
++  return @true;
++}
++
+ @end
+diff --git a/node_modules/onnxruntime-react-native/ios/TensorHelper.h b/node_modules/onnxruntime-react-native/ios/TensorHelper.h
+index f0936cc..b14ef87 100644
+--- a/node_modules/onnxruntime-react-native/ios/TensorHelper.h
++++ b/node_modules/onnxruntime-react-native/ios/TensorHelper.h
+@@ -6,6 +6,7 @@
+ 
+ #import <Foundation/Foundation.h>
+ #import <onnxruntime/onnxruntime_cxx_api.h>
++#import <jsi/jsi.h>
+ 
+ @interface TensorHelper : NSObject
+ 
+@@ -22,6 +23,11 @@ FOUNDATION_EXPORT NSString* const JsTensorTypeFloat;
+ FOUNDATION_EXPORT NSString* const JsTensorTypeDouble;
+ FOUNDATION_EXPORT NSString* const JsTensorTypeString;
+ 
+++ (Ort::Value)createInputTensorJSI:(facebook::jsi::Runtime &)runtime
++                   input:(const facebook::jsi::Object *)input
++                   ortAllocator:(OrtAllocator *)ortAllocator
++                    allocations:(std::vector<Ort::MemoryAllocation> &)allocatons;
++
+ /**
+  * It creates an input tensor from a map passed by react native js.
+  * 'data' must be a string type as data is encoded as base64. It first decodes it and creates a tensor.
+diff --git a/node_modules/onnxruntime-react-native/ios/TensorHelper.mm b/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
+index 00c1c79..2a7e035 100644
+--- a/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
++++ b/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
+@@ -3,6 +3,7 @@
+ 
+ #import "TensorHelper.h"
+ #import <Foundation/Foundation.h>
++#import <jsi/jsi.h>
+ 
+ @implementation TensorHelper
+ 
+@@ -19,6 +20,7 @@ @implementation TensorHelper
+ NSString *const JsTensorTypeDouble = @"float64";
+ NSString *const JsTensorTypeString = @"string";
+ 
++
+ /**
+  * It creates an input tensor from a map passed by react native js.
+  * 'data' must be a string type as data is encoded as base64. It first decodes it and creates a tensor.
+@@ -59,6 +61,53 @@ @implementation TensorHelper
+   }
+ }
+ 
++// copy createInputTenso but with jsi input
++/**
++ * It creates an input tensor from a map passed by react native js.
++ * 'data' must be a string type as data is encoded as base64. It first decodes it and creates a tensor.
++ */
+++ (Ort::Value)createInputTensorJSI:(facebook::jsi::Runtime &)runtime
++                   input:(const facebook::jsi::Object *)input
++                   ortAllocator:(OrtAllocator *)ortAllocator
++                    allocations:(std::vector<Ort::MemoryAllocation> &)allocatons {
++
++  // get dims
++  facebook::jsi::Array dimsArray = input->getProperty(runtime, "dims").asObject(runtime).asArray(runtime);
++  std::vector<int64_t> dims;
++  dims.reserve(dimsArray.size(runtime));
++  for (size_t i = 0; i < dimsArray.size(runtime); i++) {
++    dims.emplace_back(dimsArray.getValueAtIndex(runtime, i).asNumber());
++  }
++
++  // type
++  auto type = input->getProperty(runtime, "type").asString(runtime).utf8(runtime);
++  NSString *typeString = [NSString stringWithUTF8String:type.c_str()];
++  ONNXTensorElementDataType tensorType = [self getOnnxTensorType:typeString];
++
++  // data
++  if (tensorType == ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
++    facebook::jsi::Array values = input->getProperty(runtime, "data").asObject(runtime).asArray(runtime);
++    auto inputTensor =
++        Ort::Value::CreateTensor(ortAllocator, dims.data(), dims.size(), ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING);
++    size_t index = 0;
++    for (size_t i = 0; i < values.size(runtime); i++) {
++      auto value = values.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
++      inputTensor.FillStringTensorElement(value.c_str(), index++);
++    }
++    return inputTensor;
++  } else {
++    // data change to array buffer
++    facebook::jsi::ArrayBuffer buffer = input->getProperty(runtime, "data").asObject(runtime).getArrayBuffer(runtime);
++    NSData *bufferData = [NSData dataWithBytes:buffer.data(runtime) length:buffer.size(runtime)];
++    Ort::Value inputTensor = [self createInputTensor:tensorType
++                                                dims:dims
++                                              buffer:bufferData
++                                        ortAllocator:ortAllocator
++                                         allocations:allocatons];
++    return inputTensor;
++  }
++}
++
+ /**
+  * It creates an output map from an output tensor.
+  * a data array is encoded as base64 string.
+diff --git a/node_modules/onnxruntime-react-native/lib/backend.ts b/node_modules/onnxruntime-react-native/lib/backend.ts
+index 4ebc364..8de0d22 100644
+--- a/node_modules/onnxruntime-react-native/lib/backend.ts
++++ b/node_modules/onnxruntime-react-native/lib/backend.ts
+@@ -130,6 +130,8 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+   decodeReturnType(results: Binding.ReturnType): SessionHandler.ReturnType {
+     const returnValue: SessionHandler.ReturnType = {};
+ 
++    const t0 = performance.now()
++    let len = 0
+     for (const key in results) {
+       if (Object.hasOwnProperty.call(results, key)) {
+         let tensorData: Tensor.DataType;
+@@ -139,11 +141,14 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+           const buffer: Buffer = Buffer.from(results[key].data as string, 'base64');
+           const typedArray = tensorTypeToTypedArray(results[key].type as Tensor.Type);
+           tensorData = new typedArray(buffer.buffer, buffer.byteOffset, buffer.length / typedArray.BYTES_PER_ELEMENT);
++          
++          len += tensorData.length
+         }
+ 
+         returnValue[key] = new Tensor(results[key].type as Tensor.Type, tensorData, results[key].dims);
+       }
+     }
++    console.log(performance.now() - t0, len)
+ 
+     return returnValue;
+   }
+diff --git a/node_modules/onnxruntime-react-native/lib/binding.ts b/node_modules/onnxruntime-react-native/lib/binding.ts
+index afadbab..3282156 100644
+--- a/node_modules/onnxruntime-react-native/lib/binding.ts
++++ b/node_modules/onnxruntime-react-native/lib/binding.ts
+@@ -71,3 +71,5 @@ export declare namespace Binding {
+ // export native binding
+ const {Onnxruntime} = NativeModules;
+ export const binding = Onnxruntime as Binding.InferenceSession;
++
++Onnxruntime.install();
