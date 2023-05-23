@@ -30,7 +30,7 @@ index 500141a..49b3abd 100644
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
 diff --git a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
-index fe7bf48..a00295e 100644
+index fe7bf48..5dea10d 100644
 --- a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
 +++ b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
 @@ -3,10 +3,11 @@
@@ -46,7 +46,7 @@ index fe7bf48..a00295e 100644
  
  @implementation OnnxruntimeModule
  
-@@ -276,4 +277,93 @@ - (void)dealloc {
+@@ -276,4 +277,92 @@ - (void)dealloc {
    }
  }
  
@@ -87,7 +87,6 @@ index fe7bf48..a00295e 100644
 +        throw jsi::JSError(runtime, "onnxruntimeInferenceRun: can't find onnxruntime session");
 +      }
 +      SessionInfo *sessionInfo = (SessionInfo *)[value pointerValue];
-+      
 +
 +      std::vector<Ort::Value> feeds;
 +      std::vector<Ort::MemoryAllocation> allocations;
@@ -386,50 +385,35 @@ index 00c1c79..dc7cd1e 100644
  NSDictionary *OnnxTensorTypeToJsTensorTypeMap;
  
 diff --git a/node_modules/onnxruntime-react-native/lib/backend.ts b/node_modules/onnxruntime-react-native/lib/backend.ts
-index 4ebc364..78ef7cc 100644
+index 4ebc364..5f211c1 100644
 --- a/node_modules/onnxruntime-react-native/lib/backend.ts
 +++ b/node_modules/onnxruntime-react-native/lib/backend.ts
-@@ -44,6 +44,19 @@ const normalizePath = (path: string): string => {
-   return path;
- };
- 
-+function toArrayBuffer(buffer) {
-+  const arrayBuffer = new ArrayBuffer(buffer.length);
-+  const view = new Uint8Array(arrayBuffer);
-+  for (let i = 0; i < buffer.length; ++i) {
-+    view[i] = buffer[i];
-+  }
-+  return arrayBuffer;
-+}
-+
-+function fromArrayBuffer(arrayBuffer) {
-+  return Buffer.from(arrayBuffer);
-+}
-+
- class OnnxruntimeSessionHandler implements SessionHandler {
-   #inferenceSession: Binding.InferenceSession;
-   #key: string;
-@@ -97,9 +110,12 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -97,9 +97,17 @@ class OnnxruntimeSessionHandler implements SessionHandler {
          outputNames.push(name);
        }
      }
-+    const t0 = performance.now()
++    let t0 = performance.now()
      const input = this.encodeFeedsType(feeds);
 -    const results: Binding.ReturnType = await this.#inferenceSession.run(this.#key, input, outputNames, options);
 +    // const results: Binding.ReturnType = await this.#inferenceSession.run(this.#key, input, outputNames, options)
++    console.log('input', performance.now() - t0)
++    t0 = performance.now()
 +    const results: Binding.ReturnType = await global.__onnxruntimeInferenceRun(this.#key, input, outputNames, options);
++    console.log('run', performance.now() - t0)
++    t0 = performance.now()
      const output = this.decodeReturnType(results);
-+    console.log(performance.now() - t0)
++    console.log('output', performance.now() - t0)
++    t0 = performance.now()
      return output;
    }
  
-@@ -114,11 +130,13 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -114,11 +122,13 @@ class OnnxruntimeSessionHandler implements SessionHandler {
          } else {
            // Base64-encode tensor data
            const buffer = (feeds[key].data as SupportedTypedArray).buffer;
 -          data = Buffer.from(buffer, 0, buffer.byteLength).toString('base64');
 +          // data = Buffer.from(buffer, 0, buffer.byteLength).toString('base64');
-+          data = toArrayBuffer(Buffer.from(buffer, 0, buffer.byteLength))
++          data = buffer
          }
  
          returnValue[key] = {
@@ -439,7 +423,7 @@ index 4ebc364..78ef7cc 100644
            type: feeds[key].type,
            data,
          };
-@@ -130,18 +148,22 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -130,18 +140,22 @@ class OnnxruntimeSessionHandler implements SessionHandler {
    decodeReturnType(results: Binding.ReturnType): SessionHandler.ReturnType {
      const returnValue: SessionHandler.ReturnType = {};
  
@@ -452,7 +436,7 @@ index 4ebc364..78ef7cc 100644
          } else {
 -          const buffer: Buffer = Buffer.from(results[key].data as string, 'base64');
 +          // const buffer: Buffer = Buffer.from(results[key].data as string, 'base64');
-+          const buffer: Buffer = fromArrayBuffer(results[key].data)
++          const buffer: Buffer = Buffer.from(results[key].data)
            const typedArray = tensorTypeToTypedArray(results[key].type as Tensor.Type);
            tensorData = new typedArray(buffer.buffer, buffer.byteOffset, buffer.length / typedArray.BYTES_PER_ELEMENT);
 +          
