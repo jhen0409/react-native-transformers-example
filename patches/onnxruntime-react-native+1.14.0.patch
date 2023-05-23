@@ -30,7 +30,7 @@ index 500141a..49b3abd 100644
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
 diff --git a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
-index fe7bf48..357622b 100644
+index fe7bf48..a00295e 100644
 --- a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
 +++ b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
 @@ -3,10 +3,11 @@
@@ -46,7 +46,7 @@ index fe7bf48..357622b 100644
  
  @implementation OnnxruntimeModule
  
-@@ -276,4 +277,69 @@ - (void)dealloc {
+@@ -276,4 +277,93 @@ - (void)dealloc {
    }
  }
  
@@ -68,48 +68,72 @@ index fe7bf48..357622b 100644
 +
 +  auto& runtime = *jsiRuntime;
 +
-+  auto onnxInferenceRun = jsi::Function::createFromHostFunction(runtime,
-+    jsi::PropNameID::forAscii(runtime, "onnxInferenceRun"),
-+    1,
++  auto inferenceRun = jsi::Function::createFromHostFunction(runtime,
++    jsi::PropNameID::forAscii(runtime, "onnxruntimeInferenceRun"),
++    4,
 +    [](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* args, size_t count) -> jsi::Value {
-+      if (count != 1) {
-+        throw jsi::JSError(runtime, "onnxInferenceRun: Invalid number of args");
++      if (count != 4) {
++        throw jsi::JSError(runtime, "onnxruntimeInferenceRun: Invalid number of args");
 +      }
 +
 +      auto url = args[0].getString(runtime).utf8(runtime);
 +      auto input = args[1].asObject(runtime);
-+      auto output = args[2].asObject(runtime);
++      auto output = args[2].asObject(runtime).asArray(runtime);
 +      auto options = args[3].asObject(runtime);
 +
 +      NSString *urlString = [NSString stringWithUTF8String:url.c_str()];
 +      NSValue *value = [sessionMap objectForKey:urlString];
 +      if (value == nil) {
-+        NSException *exception = [NSException exceptionWithName:@"onnxruntime"
-+                                                        reason:@"can't find onnxruntime session"
-+                                                      userInfo:nil];
-+        @throw exception;
++        throw jsi::JSError(runtime, "onnxruntimeInferenceRun: can't find onnxruntime session");
 +      }
 +      SessionInfo *sessionInfo = (SessionInfo *)[value pointerValue];
++      
 +
 +      std::vector<Ort::Value> feeds;
 +      std::vector<Ort::MemoryAllocation> allocations;
 +      feeds.reserve(sessionInfo->inputNames.size());
 +      for (auto inputName : sessionInfo->inputNames) {
-+        auto inputTensor = input.getProperty(runtime, inputName).asObject(runtime);
-+        // TODO: check inputTensor exists
++        auto inputTensorProp = input.getProperty(runtime, inputName);
++        if (inputTensorProp.isUndefined()) {
++          throw jsi::JSError(runtime, "onnxInferenceRun: Invalid input tensor");
++        }
++        auto inputTensor = inputTensorProp.asObject(runtime);
 +
 +        Ort::Value value = [TensorHelper createInputTensorJSI:runtime input:&inputTensor ortAllocator:ortAllocator allocations:allocations];
 +        feeds.emplace_back(std::move(value));
 +      }
 +
-+      // NSDictionary *inputDict = [NSDictionary dictionaryWithDictionary:input];
-+      // NSArray *outputArray = [NSArray arrayWithArray:output];
-+      // NSDictionary *optionsDict = [NSDictionary dictionaryWithDictionary:options];
++      std::vector<const char *> requestedOutputs;
++      long outputCount = output.size(runtime);
++      requestedOutputs.reserve(outputCount);
++      for (int i = 0; i < outputCount; i++) {
++        auto outputName = output.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
++        NSString *outputNameString = [NSString stringWithUTF8String:outputName.c_str()];
++        requestedOutputs.emplace_back([outputNameString UTF8String]);
++      }
 +
-+      jsi::Object result(runtime);
-+      return result;
++      // Parse run options
++      Ort::RunOptions runOptions;
++      if (options.hasProperty(runtime, "logSeverityLevel")) {
++        int logSeverityLevel = options.getProperty(runtime, "logSeverityLevel").asNumber();
++        runOptions.SetRunLogSeverityLevel(logSeverityLevel);
++      }
++      if (options.hasProperty(runtime, "tag")) {
++        auto tag = options.getProperty(runtime, "tag").asString(runtime).utf8(runtime);
++        runOptions.SetRunTag(tag.c_str());
++      }
++
++      auto result =
++          sessionInfo->session->Run(runOptions, sessionInfo->inputNames.data(), feeds.data(),
++                                    sessionInfo->inputNames.size(), requestedOutputs.data(), requestedOutputs.size());
++
++      facebook::jsi::Object resultMap = [TensorHelper createOutputTensorJSI:runtime outputNames:requestedOutputs values:result];
++
++      return resultMap;
 +    }
 +  );
++
++  runtime.global().setProperty(runtime, "__onnxruntimeInferenceRun", std::move(inferenceRun));
 +
 +  NSLog(@"Installed ONNXRuntime Bindings!");
 +  return @true;
@@ -117,7 +141,7 @@ index fe7bf48..357622b 100644
 +
  @end
 diff --git a/node_modules/onnxruntime-react-native/ios/TensorHelper.h b/node_modules/onnxruntime-react-native/ios/TensorHelper.h
-index f0936cc..b14ef87 100644
+index f0936cc..3fc0bf0 100644
 --- a/node_modules/onnxruntime-react-native/ios/TensorHelper.h
 +++ b/node_modules/onnxruntime-react-native/ios/TensorHelper.h
 @@ -6,6 +6,7 @@
@@ -140,8 +164,27 @@ index f0936cc..b14ef87 100644
  /**
   * It creates an input tensor from a map passed by react native js.
   * 'data' must be a string type as data is encoded as base64. It first decodes it and creates a tensor.
+@@ -30,6 +36,10 @@ FOUNDATION_EXPORT NSString* const JsTensorTypeString;
+                   ortAllocator:(OrtAllocator*)ortAllocator
+                    allocations:(std::vector<Ort::MemoryAllocation>&)allocatons;
+ 
+++(facebook::jsi::Object)createOutputTensorJSI:(facebook::jsi::Runtime &)runtime
++                            outputNames:(const std::vector<const char*>&)outputNames
++                            values:(const std::vector<Ort::Value>&)values;
++
+ /**
+  * It creates an output map from an output tensor.
+  * a data array is encoded as base64 string.
+@@ -37,6 +47,7 @@ FOUNDATION_EXPORT NSString* const JsTensorTypeString;
+ +(NSDictionary*)createOutputTensor:(const std::vector<const char*>&)outputNames
+                             values:(const std::vector<Ort::Value>&)values;
+ 
++
+ @end
+ 
+ #endif /* TensorHelper_h */
 diff --git a/node_modules/onnxruntime-react-native/ios/TensorHelper.mm b/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
-index 00c1c79..2a7e035 100644
+index 00c1c79..dc7cd1e 100644
 --- a/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
 +++ b/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
 @@ -3,6 +3,7 @@
@@ -160,11 +203,11 @@ index 00c1c79..2a7e035 100644
  /**
   * It creates an input tensor from a map passed by react native js.
   * 'data' must be a string type as data is encoded as base64. It first decodes it and creates a tensor.
-@@ -59,6 +61,53 @@ @implementation TensorHelper
+@@ -59,6 +61,61 @@ @implementation TensorHelper
    }
  }
  
-+// copy createInputTenso but with jsi input
++// copy createInputTensor but with jsi input
 +/**
 + * It creates an input tensor from a map passed by react native js.
 + * 'data' must be a string type as data is encoded as base64. It first decodes it and creates a tensor.
@@ -174,12 +217,13 @@ index 00c1c79..2a7e035 100644
 +                   ortAllocator:(OrtAllocator *)ortAllocator
 +                    allocations:(std::vector<Ort::MemoryAllocation> &)allocatons {
 +
-+  // get dims
++  // shape
 +  facebook::jsi::Array dimsArray = input->getProperty(runtime, "dims").asObject(runtime).asArray(runtime);
 +  std::vector<int64_t> dims;
 +  dims.reserve(dimsArray.size(runtime));
 +  for (size_t i = 0; i < dimsArray.size(runtime); i++) {
-+    dims.emplace_back(dimsArray.getValueAtIndex(runtime, i).asNumber());
++    auto dim = dimsArray.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
++    dims.emplace_back(std::stoll(dim));
 +  }
 +
 +  // type
@@ -200,8 +244,15 @@ index 00c1c79..2a7e035 100644
 +    return inputTensor;
 +  } else {
 +    // data change to array buffer
-+    facebook::jsi::ArrayBuffer buffer = input->getProperty(runtime, "data").asObject(runtime).getArrayBuffer(runtime);
-+    NSData *bufferData = [NSData dataWithBytes:buffer.data(runtime) length:buffer.size(runtime)];
++    auto obj = input->getProperty(runtime, "data").asObject(runtime);
++    if (!obj.isArrayBuffer(runtime)) {
++      throw facebook::jsi::JSError(runtime, "data must be an ArrayBuffer");
++    }
++    facebook::jsi::ArrayBuffer buffer = obj.getArrayBuffer(runtime);
++    // if (buffer.size(runtime) == 0) {
++    //   throw facebook::jsi::JSError(runtime, "data must not be empty");
++    // }
++    NSData *bufferData = [NSData dataWithBytesNoCopy:buffer.data(runtime) length:buffer.size(runtime) freeWhenDone:NO];
 +    Ort::Value inputTensor = [self createInputTensor:tensorType
 +                                                dims:dims
 +                                              buffer:bufferData
@@ -214,34 +265,205 @@ index 00c1c79..2a7e035 100644
  /**
   * It creates an output map from an output tensor.
   * a data array is encoded as base64 string.
+@@ -119,6 +176,65 @@ + (NSDictionary *)createOutputTensor:(const std::vector<const char *> &)outputNa
+   return outputTensorMap;
+ }
+ 
+++ (facebook::jsi::Object)createOutputTensorJSI:(facebook::jsi::Runtime &)runtime
++                                        outputNames:(const std::vector<const char *> &)outputNames
++                                        values:(const std::vector<Ort::Value> &)values {
++  if (outputNames.size() != values.size()) {
++    throw facebook::jsi::JSError(runtime, "output name and tensor count mismatched");
++  }
++
++  facebook::jsi::Object outputTensorMap(runtime);
++
++  for (size_t i = 0; i < outputNames.size(); ++i) {
++    const auto outputName = outputNames[i];
++    const Ort::Value &value = values[i];
++
++    if (!value.IsTensor()) {
++      throw facebook::jsi::JSError(runtime, "only tensor type is supported");
++    }
++
++    facebook::jsi::Object outputTensor(runtime);
++
++    // dims
++    auto dims = value.GetTensorTypeAndShapeInfo().GetShape();
++    facebook::jsi::Array outputDims(runtime, dims.size());
++    for (size_t i = 0; i < dims.size(); i++) {
++      // convert to string due to jsi not supported int64_t
++      outputDims.setValueAtIndex(runtime, i, std::to_string(dims[i]));
++    }
++    outputTensor.setProperty(runtime, "dims", std::move(outputDims));
++
++    // type
++    NSString *jsTensorType = [self getJsTensorType:value.GetTensorTypeAndShapeInfo().GetElementType()];
++    outputTensor.setProperty(runtime, "type",
++                             facebook::jsi::String::createFromUtf8(runtime, [jsTensorType UTF8String]));
++
++    // data
++    if (value.GetTensorTypeAndShapeInfo().GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING) {
++      facebook::jsi::Array buffer(runtime, value.GetTensorTypeAndShapeInfo().GetElementCount());
++      for (size_t i = 0; i < value.GetTensorTypeAndShapeInfo().GetElementCount(); ++i) {
++        size_t elementLength = value.GetStringTensorElementLength(i);
++        std::string element(elementLength, '\0');
++        value.GetStringTensorElement(elementLength, i, (void *)element.data());
++        buffer.setValueAtIndex(runtime, i, facebook::jsi::String::createFromUtf8(runtime, element));
++      }
++      outputTensor.setProperty(runtime, "data", std::move(buffer));
++    } else {
++      NSData *data = [self createOutputTensorJSI:value];
++        // TODO: Use no-copy ArrayBuffer?
++      facebook::jsi::Function arrayBufferCtor = runtime.global().getPropertyAsFunction(runtime, "ArrayBuffer");
++      facebook::jsi::Object o = arrayBufferCtor.callAsConstructor(runtime, (int)data.length).getObject(runtime);
++      facebook::jsi::ArrayBuffer buf = o.getArrayBuffer(runtime);
++      memcpy(buf.data(runtime), data.bytes, data.length);
++      outputTensor.setProperty(runtime, "data", buf);
++    }
++
++    outputTensorMap.setProperty(runtime, outputName, outputTensor);
++  }
++  return outputTensorMap;
++}
++  
++
+ template <typename T>
+ static Ort::Value createInputTensorT(OrtAllocator *ortAllocator, const std::vector<int64_t> &dims, NSData *buffer,
+                                      std::vector<Ort::MemoryAllocation> &allocations) {
+@@ -216,6 +332,53 @@ + (NSString *)createOutputTensor:(const Ort::Value &)tensor {
+   }
+ }
+ 
++
++template <typename T> static NSData *createOutputTensorTJSI(const Ort::Value &tensor) {
++  const auto data = tensor.GetTensorData<T>();
++  NSData *buffer = [NSData dataWithBytesNoCopy:(void *)data
++                                        length:tensor.GetTensorTypeAndShapeInfo().GetElementCount() * sizeof(T)
++                                  freeWhenDone:false];
++  return buffer;
++}
++
+++ (NSData *)createOutputTensorJSI:(const Ort::Value &)tensor {
++  ONNXTensorElementDataType tensorType = tensor.GetTensorTypeAndShapeInfo().GetElementType();
++
++  switch (tensorType) {
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
++    return createOutputTensorTJSI<float_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
++    return createOutputTensorTJSI<uint8_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
++    return createOutputTensorTJSI<int8_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
++    return createOutputTensorTJSI<int16_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
++    return createOutputTensorTJSI<int32_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
++    return createOutputTensorTJSI<int64_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
++    return createOutputTensorTJSI<bool>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
++    return createOutputTensorTJSI<double_t>(tensor);
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX64:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_COMPLEX128:
++  case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
++  default: {
++    NSException *exception = [NSException exceptionWithName:@"create output tensor"
++                                                     reason:@"unsupported tensor type"
++                                                   userInfo:nil];
++    @throw exception;
++  }
++  }
++}
++
+ NSDictionary *JsTensorTypeToOnnxTensorTypeMap;
+ NSDictionary *OnnxTensorTypeToJsTensorTypeMap;
+ 
 diff --git a/node_modules/onnxruntime-react-native/lib/backend.ts b/node_modules/onnxruntime-react-native/lib/backend.ts
-index 4ebc364..8de0d22 100644
+index 4ebc364..78ef7cc 100644
 --- a/node_modules/onnxruntime-react-native/lib/backend.ts
 +++ b/node_modules/onnxruntime-react-native/lib/backend.ts
-@@ -130,6 +130,8 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -44,6 +44,19 @@ const normalizePath = (path: string): string => {
+   return path;
+ };
+ 
++function toArrayBuffer(buffer) {
++  const arrayBuffer = new ArrayBuffer(buffer.length);
++  const view = new Uint8Array(arrayBuffer);
++  for (let i = 0; i < buffer.length; ++i) {
++    view[i] = buffer[i];
++  }
++  return arrayBuffer;
++}
++
++function fromArrayBuffer(arrayBuffer) {
++  return Buffer.from(arrayBuffer);
++}
++
+ class OnnxruntimeSessionHandler implements SessionHandler {
+   #inferenceSession: Binding.InferenceSession;
+   #key: string;
+@@ -97,9 +110,12 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+         outputNames.push(name);
+       }
+     }
++    const t0 = performance.now()
+     const input = this.encodeFeedsType(feeds);
+-    const results: Binding.ReturnType = await this.#inferenceSession.run(this.#key, input, outputNames, options);
++    // const results: Binding.ReturnType = await this.#inferenceSession.run(this.#key, input, outputNames, options)
++    const results: Binding.ReturnType = await global.__onnxruntimeInferenceRun(this.#key, input, outputNames, options);
+     const output = this.decodeReturnType(results);
++    console.log(performance.now() - t0)
+     return output;
+   }
+ 
+@@ -114,11 +130,13 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+         } else {
+           // Base64-encode tensor data
+           const buffer = (feeds[key].data as SupportedTypedArray).buffer;
+-          data = Buffer.from(buffer, 0, buffer.byteLength).toString('base64');
++          // data = Buffer.from(buffer, 0, buffer.byteLength).toString('base64');
++          data = toArrayBuffer(Buffer.from(buffer, 0, buffer.byteLength))
+         }
+ 
+         returnValue[key] = {
+-          dims: feeds[key].dims,
++          // dims: feeds[key].dims,
++          dims: feeds[key].dims.map(dim => String(dim)),
+           type: feeds[key].type,
+           data,
+         };
+@@ -130,18 +148,22 @@ class OnnxruntimeSessionHandler implements SessionHandler {
    decodeReturnType(results: Binding.ReturnType): SessionHandler.ReturnType {
      const returnValue: SessionHandler.ReturnType = {};
  
-+    const t0 = performance.now()
 +    let len = 0
      for (const key in results) {
        if (Object.hasOwnProperty.call(results, key)) {
          let tensorData: Tensor.DataType;
-@@ -139,11 +141,14 @@ class OnnxruntimeSessionHandler implements SessionHandler {
-           const buffer: Buffer = Buffer.from(results[key].data as string, 'base64');
+         if (Array.isArray(results[key].data)) {
+           tensorData = results[key].data as string[];
+         } else {
+-          const buffer: Buffer = Buffer.from(results[key].data as string, 'base64');
++          // const buffer: Buffer = Buffer.from(results[key].data as string, 'base64');
++          const buffer: Buffer = fromArrayBuffer(results[key].data)
            const typedArray = tensorTypeToTypedArray(results[key].type as Tensor.Type);
            tensorData = new typedArray(buffer.buffer, buffer.byteOffset, buffer.length / typedArray.BYTES_PER_ELEMENT);
 +          
 +          len += tensorData.length
          }
  
-         returnValue[key] = new Tensor(results[key].type as Tensor.Type, tensorData, results[key].dims);
+-        returnValue[key] = new Tensor(results[key].type as Tensor.Type, tensorData, results[key].dims);
++        returnValue[key] = new Tensor(results[key].type as Tensor.Type, tensorData, results[key].dims.map(dim => Number(dim)));
        }
      }
-+    console.log(performance.now() - t0, len)
  
-     return returnValue;
-   }
 diff --git a/node_modules/onnxruntime-react-native/lib/binding.ts b/node_modules/onnxruntime-react-native/lib/binding.ts
 index afadbab..3282156 100644
 --- a/node_modules/onnxruntime-react-native/lib/binding.ts
