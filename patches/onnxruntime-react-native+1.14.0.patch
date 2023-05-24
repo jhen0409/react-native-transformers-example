@@ -29,24 +29,363 @@ index 500141a..49b3abd 100644
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
+diff --git a/node_modules/onnxruntime-react-native/cpp/ThreadPool.cpp b/node_modules/onnxruntime-react-native/cpp/ThreadPool.cpp
+new file mode 100644
+index 0000000..848d5f6
+--- /dev/null
++++ b/node_modules/onnxruntime-react-native/cpp/ThreadPool.cpp
+@@ -0,0 +1,92 @@
++#include "ThreadPool.h"
++
++ThreadPool::ThreadPool() : done(false)
++{
++  // This returns the number of threads supported by the system. If the
++  // function can't figure out this information, it returns 0. 0 is not good,
++  // so we create at least 1
++  auto numberOfThreads = std::thread::hardware_concurrency();
++  if (numberOfThreads == 0)
++  {
++    numberOfThreads = 1;
++  }
++
++  for (unsigned i = 0; i < numberOfThreads; ++i)
++  {
++    // The threads will execute the private member `doWork`. Note that we need
++    // to pass a reference to the function (namespaced with the class name) as
++    // the first argument, and the current object as second argument
++    threads.push_back(std::thread(&ThreadPool::doWork, this));
++  }
++}
++
++// The destructor joins all the threads so the program can exit gracefully.
++// This will be executed if there is any exception (e.g. creating the threads)
++ThreadPool::~ThreadPool()
++{
++  // So threads know it's time to shut down
++  done = true;
++
++  // Wake up all the threads, so they can finish and be joined
++  workQueueConditionVariable.notify_all();
++  for (auto &thread : threads)
++  {
++    if (thread.joinable())
++    {
++      thread.join();
++    }
++  }
++}
++
++// This function will be called by the server every time there is a request
++// that needs to be processed by the thread pool
++void ThreadPool::queueWork(std::function<void(void)> task)
++{
++  // Grab the mutex
++  std::lock_guard<std::mutex> g(workQueueMutex);
++
++  // Push the request to the queue
++  workQueue.push(task);
++
++  // Notify one thread that there are requests to process
++  workQueueConditionVariable.notify_one();
++}
++
++// Function used by the threads to grab work from the queue
++void ThreadPool::doWork()
++{
++  // Loop while the queue is not destructing
++  while (!done)
++  {
++    std::function<void(void)> task;
++
++    // Create a scope, so we don't lock the queue for longer than necessary
++    {
++      std::unique_lock<std::mutex> g(workQueueMutex);
++      workQueueConditionVariable.wait(g, [&]
++                                      {
++        // Only wake up if there are elements in the queue or the program is
++        // shutting down
++        return !workQueue.empty() || done; });
++
++      // If we are shutting down exit witout trying to process more work
++      if (done)
++      {
++        break;
++      }
++
++      task = workQueue.front();
++      workQueue.pop();
++    }
++    ++busy;
++    task();
++    --busy;
++  }
++}
++
++void ThreadPool::waitFinished()
++{
++  std::unique_lock<std::mutex> g(workQueueMutex);
++  workQueueConditionVariable.wait(g, [&]
++                                  { return workQueue.empty() && (busy == 0); });
++}
+\ No newline at end of file
+diff --git a/node_modules/onnxruntime-react-native/cpp/ThreadPool.h b/node_modules/onnxruntime-react-native/cpp/ThreadPool.h
+new file mode 100644
+index 0000000..4369894
+--- /dev/null
++++ b/node_modules/onnxruntime-react-native/cpp/ThreadPool.h
+@@ -0,0 +1,50 @@
++//
++//  ThreadPool.hpp
++//  react-native-quick-sqlite
++//
++//  Created by Oscar on 13.03.22.
++//
++
++#ifndef ThreadPool_hpp
++#define ThreadPool_hpp
++
++#include <condition_variable>
++#include <exception>
++#include <mutex>
++#include <queue>
++#include <stdio.h>
++#include <thread>
++#include <vector>
++
++class ThreadPool
++{
++public:
++  ThreadPool();
++  ~ThreadPool();
++  void queueWork(std::function<void(void)> task);
++  void waitFinished();
++
++private:
++  unsigned int busy;
++  // This condition variable is used for the threads to wait until there is work
++  // to do
++  std::condition_variable_any workQueueConditionVariable;
++
++  // We store the threads in a vector, so we can later stop them gracefully
++  std::vector<std::thread> threads;
++
++  // Mutex to protect workQueue
++  std::mutex workQueueMutex;
++
++  // Queue of requests waiting to be processed
++  std::queue<std::function<void(void)>> workQueue;
++
++  // This will be set to true when the thread pool is shutting down. This tells
++  // the threads to stop looping and finish
++  bool done;
++
++  // Function used by the threads to grab work from the queue
++  void doWork();
++};
++
++#endif /* ThreadPool_hpp */
+\ No newline at end of file
 diff --git a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
-index fe7bf48..5dea10d 100644
+index fe7bf48..85e555f 100644
 --- a/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
 +++ b/node_modules/onnxruntime-react-native/ios/OnnxruntimeModule.mm
-@@ -3,10 +3,11 @@
+@@ -6,7 +6,26 @@
  
- #import "OnnxruntimeModule.h"
- #import "TensorHelper.h"
--
  #import <Foundation/Foundation.h>
  #import <React/RCTLog.h>
- #import <onnxruntime/onnxruntime_cxx_api.h>
-+#import <jsi/jsi.h>
+-#import <onnxruntime/onnxruntime_cxx_api.h>
 +#import <React/RCTBridge+Private.h>
++#import <React/RCTUtils.h>
++#import <ReactCommon/RCTTurboModule.h>
++#import <jsi/jsi.h>
++
++#import "ThreadPool.h"
++
++// Note: Using below syntax for including ort c api and ort extensions headers to resolve a compiling error happened
++// in an expo react native ios app when ort extensions enabled (a redefinition error of multiple object types defined
++// within ORT C API header). It's an edge case that compiler allows both ort c api headers to be included when #include
++// syntax doesn't match. For the case when extensions not enabled, it still requires a onnxruntime prefix directory for
++// searching paths. Also in general, it's a convention to use #include for C/C++ headers rather then #import. See:
++// https://google.github.io/styleguide/objcguide.html#import-and-include
++// https://microsoft.github.io/objc-guide/Headers/ImportAndInclude.html
++#ifdef ORT_ENABLE_EXTENSIONS
++#include "onnxruntime_cxx_api.h"
++#include "onnxruntime_extensions.h"
++#else
++#include "onnxruntime/onnxruntime_cxx_api.h"
++#endif
  
  @implementation OnnxruntimeModule
  
-@@ -276,4 +277,92 @@ - (void)dealloc {
+@@ -22,6 +41,13 @@ @implementation OnnxruntimeModule
+ static NSMutableDictionary *sessionMap = [NSMutableDictionary dictionary];
+ static Ort::AllocatorWithDefaultOptions ortAllocator;
+ 
++static int nextSessionId = 0;
++- (NSString *)getNextSessionKey {
++  NSString *key = @(nextSessionId).stringValue;
++  nextSessionId++;
++  return key;
++}
++
+ RCT_EXPORT_MODULE(Onnxruntime)
+ 
+ /**
+@@ -43,7 +69,30 @@ @implementation OnnxruntimeModule
+     NSDictionary *resultMap = [self loadModel:modelPath options:options];
+     resolve(resultMap);
+   } @catch (...) {
+-    reject(@"onnxruntime", @"can't load model", nil);
++    reject(@"onnxruntime", @"failed to load model", nil);
++  }
++}
++
++/**
++ * React native binding API to load a model using BASE64 encoded model data string.
++ *
++ * @param modelData the BASE64 encoded model data string
++ * @param options onnxruntime session options
++ * @param resolve callback for returning output back to react native js
++ * @param reject callback for returning an error back to react native js
++ * @note when run() is called, the same modelPath must be passed into the first parameter.
++ */
++RCT_EXPORT_METHOD(loadModelFromBase64EncodedBuffer
++                  : (NSString *)modelDataBase64EncodedString options
++                  : (NSDictionary *)options resolver
++                  : (RCTPromiseResolveBlock)resolve rejecter
++                  : (RCTPromiseRejectBlock)reject) {
++  @try {
++    NSData *modelDataDecoded = [[NSData alloc] initWithBase64EncodedString:modelDataBase64EncodedString options:0];
++    NSDictionary *resultMap = [self loadModelFromBuffer:modelDataDecoded options:options];
++    resolve(resultMap);
++  } @catch (...) {
++    reject(@"onnxruntime", @"failed to load model from buffer", nil);
+   }
+ }
+ 
+@@ -68,49 +117,75 @@ @implementation OnnxruntimeModule
+     NSDictionary *resultMap = [self run:url input:input output:output options:options];
+     resolve(resultMap);
+   } @catch (...) {
+-    reject(@"onnxruntime", @"can't run model", nil);
++    reject(@"onnxruntime", @"failed to run model", nil);
+   }
+ }
+ 
+ /**
+  * Load a model using given model path.
+  *
+- * @param modelPath a model file location. it's used as a key when multiple sessions are created, i.e. multiple models
+- * are loaded.
+- * @param options onnxruntime session options
++ * @param modelPath a model file location.
++ * @param options onnxruntime session options.
+  * @note when run() is called, the same modelPath must be passed into the first parameter.
+  */
+ - (NSDictionary *)loadModel:(NSString *)modelPath options:(NSDictionary *)options {
+-  NSValue *value = [sessionMap objectForKey:modelPath];
+-  SessionInfo *sessionInfo = nullptr;
+-  if (value == nil) {
+-    sessionInfo = new SessionInfo();
++  return [self loadModelImpl:modelPath modelData:nil options:options];
++}
+ 
+-    Ort::SessionOptions sessionOptions = [self parseSessionOptions:options];
+-    sessionInfo->session.reset(new Ort::Session(*ortEnv, [modelPath UTF8String], sessionOptions));
++/**
++ * Load a model using given model data array
++ *
++ * @param modelData the model data buffer.
++ * @param options onnxruntime session options
++ */
++- (NSDictionary *)loadModelFromBuffer:(NSData *)modelData options:(NSDictionary *)options {
++  return [self loadModelImpl:@"" modelData:modelData options:options];
++}
+ 
+-    sessionInfo->inputNames.reserve(sessionInfo->session->GetInputCount());
+-    for (size_t i = 0; i < sessionInfo->session->GetInputCount(); ++i) {
+-      auto inputName = sessionInfo->session->GetInputNameAllocated(i, ortAllocator);
+-      sessionInfo->inputNames.emplace_back(inputName.get());
+-      sessionInfo->inputNames_ptrs.emplace_back(std::move(inputName));
+-    }
++/**
++ * Load model implementation method given either model data array or model path
++ *
++ * @param modelPath the model file location.
++ * @param modelData the model data buffer.
++ * @param options onnxruntime session options.
++ */
++- (NSDictionary *)loadModelImpl:(NSString *)modelPath modelData:(NSData *)modelData options:(NSDictionary *)options {
++  SessionInfo *sessionInfo = nullptr;
++  sessionInfo = new SessionInfo();
++  Ort::SessionOptions sessionOptions = [self parseSessionOptions:options];
+ 
+-    sessionInfo->outputNames.reserve(sessionInfo->session->GetOutputCount());
+-    for (size_t i = 0; i < sessionInfo->session->GetOutputCount(); ++i) {
+-      auto outputName = sessionInfo->session->GetOutputNameAllocated(i, ortAllocator);
+-      sessionInfo->outputNames.emplace_back(outputName.get());
+-      sessionInfo->outputNames_ptrs.emplace_back(std::move(outputName));
+-    }
++#ifdef ORT_ENABLE_EXTENSIONS
++  Ort::ThrowOnError(RegisterCustomOps(sessionOptions, OrtGetApiBase()));
++#endif
+ 
+-    value = [NSValue valueWithPointer:(void *)sessionInfo];
+-    sessionMap[modelPath] = value;
++  if (modelData == nil) {
++    sessionInfo->session.reset(new Ort::Session(*ortEnv, [modelPath UTF8String], sessionOptions));
+   } else {
+-    sessionInfo = (SessionInfo *)[value pointerValue];
++    NSUInteger dataLength = [modelData length];
++    Byte *modelBytes = (Byte *)[modelData bytes];
++    sessionInfo->session.reset(new Ort::Session(*ortEnv, modelBytes, (size_t)dataLength, sessionOptions));
++  }
++
++  sessionInfo->inputNames.reserve(sessionInfo->session->GetInputCount());
++  for (size_t i = 0; i < sessionInfo->session->GetInputCount(); ++i) {
++    auto inputName = sessionInfo->session->GetInputNameAllocated(i, ortAllocator);
++    sessionInfo->inputNames.emplace_back(inputName.get());
++    sessionInfo->inputNames_ptrs.emplace_back(std::move(inputName));
++  }
++
++  sessionInfo->outputNames.reserve(sessionInfo->session->GetOutputCount());
++  for (size_t i = 0; i < sessionInfo->session->GetOutputCount(); ++i) {
++    auto outputName = sessionInfo->session->GetOutputNameAllocated(i, ortAllocator);
++    sessionInfo->outputNames.emplace_back(outputName.get());
++    sessionInfo->outputNames_ptrs.emplace_back(std::move(outputName));
+   }
+ 
++  NSString *key = [self getNextSessionKey];
++  NSValue *value = [NSValue valueWithPointer:(void *)sessionInfo];
++  sessionMap[key] = value;
++
+   NSMutableDictionary *resultMap = [NSMutableDictionary dictionary];
+-  resultMap[@"key"] = modelPath;
++  resultMap[@"key"] = key;
+ 
+   NSMutableArray *inputNames = [NSMutableArray array];
+   for (auto inputName : sessionInfo->inputNames) {
+@@ -127,6 +202,19 @@ - (NSDictionary *)loadModel:(NSString *)modelPath options:(NSDictionary *)option
+   return resultMap;
+ }
+ 
++
++//- (facebook::jsi::Object)loadModelImplJSI:(NSString *)modelPath
++//                                    modelData:(NSData *)modelData
++//                                    options:(facebook::jsi::Object)options {
++//  SessionInfo *sessionInfo = nullptr;
++//  sessionInfo = new SessionInfo();
++//
++//  // TODO
++//  // Ort::SessionOptions sessionOptions = [self parseSessionOptionsJSI:options];
++//
++//
++//}
++
+ /**
+  * Run a model using given uri.
+  *
+@@ -276,4 +364,125 @@ - (void)dealloc {
    }
  }
  
@@ -60,79 +399,112 @@ index fe7bf48..5dea10d 100644
 +  }
 +
 +  using namespace facebook;
-+  
++
 +  auto jsiRuntime = (jsi::Runtime*) cxxBridge.runtime;
 +  if (jsiRuntime == nil) {
 +    return @false;
 +  }
 +
 +  auto& runtime = *jsiRuntime;
++  auto pool = std::make_shared<ThreadPool>();
++  auto callInvoker = bridge.jsCallInvoker;
 +
-+  auto inferenceRun = jsi::Function::createFromHostFunction(runtime,
-+    jsi::PropNameID::forAscii(runtime, "onnxruntimeInferenceRun"),
++  /**
++    * Run a model using given uri.
++    *
++    * @param url a model path location given at loadModel()
++    * @param input an input tensor
++    * @param output an output names to be returned
++    * @param options onnxruntime run options
++    */
++  auto run = jsi::Function::createFromHostFunction(runtime,
++    jsi::PropNameID::forAscii(runtime, "onnxruntimeSessionRun"),
 +    4,
-+    [](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* args, size_t count) -> jsi::Value {
++    [pool, callInvoker](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* args, size_t count) -> jsi::Value {
 +      if (count != 4) {
-+        throw jsi::JSError(runtime, "onnxruntimeInferenceRun: Invalid number of args");
++        throw jsi::JSError(runtime, "onnxruntimeSessionRun: Invalid number of args");
 +      }
 +
-+      auto url = args[0].getString(runtime).utf8(runtime);
-+      auto input = args[1].asObject(runtime);
-+      auto output = args[2].asObject(runtime).asArray(runtime);
-+      auto options = args[3].asObject(runtime);
++      auto promise = runtime.global().getPropertyAsFunction(runtime, "Promise");
++      return promise.callAsConstructor(runtime, jsi::Function::createFromHostFunction(runtime,
++        jsi::PropNameID::forAscii(runtime, "executor"),
++        2,
++        [args, pool, callInvoker](jsi::Runtime &runtime, const jsi::Value &thisValue, const jsi::Value *pargs, size_t) -> jsi::Value
++      {
++        auto resolve = std::make_shared<jsi::Value>(runtime, pargs[0]);
++        auto reject = std::make_shared<jsi::Value>(runtime, pargs[1]);
 +
-+      NSString *urlString = [NSString stringWithUTF8String:url.c_str()];
-+      NSValue *value = [sessionMap objectForKey:urlString];
-+      if (value == nil) {
-+        throw jsi::JSError(runtime, "onnxruntimeInferenceRun: can't find onnxruntime session");
-+      }
-+      SessionInfo *sessionInfo = (SessionInfo *)[value pointerValue];
++        auto url = args[0].getString(runtime).utf8(runtime);
++        auto input = args[1].asObject(runtime);
++        auto output = std::make_shared<jsi::Array>(args[2].asObject(runtime).asArray(runtime));
++        auto options = args[3].asObject(runtime);
 +
-+      std::vector<Ort::Value> feeds;
-+      std::vector<Ort::MemoryAllocation> allocations;
-+      feeds.reserve(sessionInfo->inputNames.size());
-+      for (auto inputName : sessionInfo->inputNames) {
-+        auto inputTensorProp = input.getProperty(runtime, inputName);
-+        if (inputTensorProp.isUndefined()) {
-+          throw jsi::JSError(runtime, "onnxInferenceRun: Invalid input tensor");
++        NSString *urlString = [NSString stringWithUTF8String:url.c_str()];
++        NSValue *value = [sessionMap objectForKey:urlString];
++        if (value == nil) {
++          throw jsi::JSError(runtime, "onnxruntimeSessionRun: can't find onnxruntime session");
 +        }
-+        auto inputTensor = inputTensorProp.asObject(runtime);
++        SessionInfo *sessionInfo = (SessionInfo *)[value pointerValue];
 +
-+        Ort::Value value = [TensorHelper createInputTensorJSI:runtime input:&inputTensor ortAllocator:ortAllocator allocations:allocations];
-+        feeds.emplace_back(std::move(value));
-+      }
++        auto feeds = std::make_shared<std::vector<Ort::Value>>();
++        std::vector<Ort::MemoryAllocation> allocations;
++        feeds->reserve(sessionInfo->inputNames.size());
++        for (auto inputName : sessionInfo->inputNames) {
++          auto inputTensorProp = input.getProperty(runtime, inputName);
++          if (inputTensorProp.isUndefined()) {
++            throw jsi::JSError(runtime, "onnxInferenceRun: Invalid input tensor");
++          }
++          auto inputTensor = inputTensorProp.asObject(runtime);
 +
-+      std::vector<const char *> requestedOutputs;
-+      long outputCount = output.size(runtime);
-+      requestedOutputs.reserve(outputCount);
-+      for (int i = 0; i < outputCount; i++) {
-+        auto outputName = output.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
-+        NSString *outputNameString = [NSString stringWithUTF8String:outputName.c_str()];
-+        requestedOutputs.emplace_back([outputNameString UTF8String]);
-+      }
++          Ort::Value value = [TensorHelper createInputTensorJSI:runtime input:&inputTensor ortAllocator:ortAllocator allocations:allocations];
++          feeds->emplace_back(std::move(value));
++        }
 +
-+      // Parse run options
-+      Ort::RunOptions runOptions;
-+      if (options.hasProperty(runtime, "logSeverityLevel")) {
-+        int logSeverityLevel = options.getProperty(runtime, "logSeverityLevel").asNumber();
-+        runOptions.SetRunLogSeverityLevel(logSeverityLevel);
-+      }
-+      if (options.hasProperty(runtime, "tag")) {
-+        auto tag = options.getProperty(runtime, "tag").asString(runtime).utf8(runtime);
-+        runOptions.SetRunTag(tag.c_str());
-+      }
++        auto requestedOutputs = std::make_shared<std::vector<const char *>>();
++        long outputCount = output->size(runtime);
++        requestedOutputs->reserve(outputCount);
++        for (int i = 0; i < outputCount; i++) {
++          auto outputName = output->getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
++          NSString *outputNameString = [NSString stringWithUTF8String:outputName.c_str()];
++          requestedOutputs->emplace_back([outputNameString UTF8String]);
++        }
 +
-+      auto result =
-+          sessionInfo->session->Run(runOptions, sessionInfo->inputNames.data(), feeds.data(),
-+                                    sessionInfo->inputNames.size(), requestedOutputs.data(), requestedOutputs.size());
++        // Parse run options
++        auto runOptions = std::make_shared<Ort::RunOptions>();
++        if (options.hasProperty(runtime, "logSeverityLevel")) {
++          int logSeverityLevel = options.getProperty(runtime, "logSeverityLevel").asNumber();
++          runOptions->SetRunLogSeverityLevel(logSeverityLevel);
++        }
++        if (options.hasProperty(runtime, "tag")) {
++          auto tag = options.getProperty(runtime, "tag").asString(runtime).utf8(runtime);
++          runOptions->SetRunTag(tag.c_str());
++        }
 +
-+      facebook::jsi::Object resultMap = [TensorHelper createOutputTensorJSI:runtime outputNames:requestedOutputs values:result];
++        pool->queueWork([callInvoker, &runtime, output, runOptions, sessionInfo, feeds, requestedOutputs, resolve, reject]() {
++          auto result =
++            sessionInfo->session->Run(*runOptions, sessionInfo->inputNames.data(), feeds->data(),
++                                      sessionInfo->inputNames.size(), requestedOutputs->data(), requestedOutputs->size());
 +
-+      return resultMap;
++          auto resultPtr = std::make_shared<std::vector<Ort::Value>>(std::move(result));
++          callInvoker->invokeAsync([&runtime, output, resultPtr, resolve]{
++            auto requestedOutputs = std::make_shared<std::vector<const char *>>();
++            long outputCount = output->asArray(runtime).size(runtime);
++            requestedOutputs->reserve(outputCount);
++            for (int i = 0; i < outputCount; i++) {
++              auto outputName = output->getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
++              NSString *outputNameString = [NSString stringWithUTF8String:outputName.c_str()];
++              requestedOutputs->emplace_back([outputNameString UTF8String]);
++            }
++            facebook::jsi::Object resultMap = [TensorHelper createOutputTensorJSI:runtime outputNames:*requestedOutputs values:*resultPtr];
++            resolve->asObject(runtime).asFunction(runtime).call(runtime, std::move(resultMap));
++          });
++        });
++        return {};
++      }));
 +    }
 +  );
 +
-+  runtime.global().setProperty(runtime, "__onnxruntimeInferenceRun", std::move(inferenceRun));
++  runtime.global().setProperty(runtime, "__onnxruntimeSessionRun", std::move(run));
 +
 +  NSLog(@"Installed ONNXRuntime Bindings!");
 +  return @true;
@@ -183,7 +555,7 @@ index f0936cc..3fc0bf0 100644
  
  #endif /* TensorHelper_h */
 diff --git a/node_modules/onnxruntime-react-native/ios/TensorHelper.mm b/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
-index 00c1c79..dc7cd1e 100644
+index 00c1c79..8d4a350 100644
 --- a/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
 +++ b/node_modules/onnxruntime-react-native/ios/TensorHelper.mm
 @@ -3,6 +3,7 @@
@@ -221,8 +593,8 @@ index 00c1c79..dc7cd1e 100644
 +  std::vector<int64_t> dims;
 +  dims.reserve(dimsArray.size(runtime));
 +  for (size_t i = 0; i < dimsArray.size(runtime); i++) {
-+    auto dim = dimsArray.getValueAtIndex(runtime, i).asString(runtime).utf8(runtime);
-+    dims.emplace_back(std::stoll(dim));
++    auto dim = dimsArray.getValueAtIndex(runtime, i).asNumber();
++    dims.emplace_back(dim);
 +  }
 +
 +  // type
@@ -291,8 +663,8 @@ index 00c1c79..dc7cd1e 100644
 +    auto dims = value.GetTensorTypeAndShapeInfo().GetShape();
 +    facebook::jsi::Array outputDims(runtime, dims.size());
 +    for (size_t i = 0; i < dims.size(); i++) {
-+      // convert to string due to jsi not supported int64_t
-+      outputDims.setValueAtIndex(runtime, i, std::to_string(dims[i]));
++      // NOTE: onnxruntime-common js only supported safe integer dim
++      outputDims.setValueAtIndex(runtime, i, (int) dims[i]);
 +    }
 +    outputTensor.setProperty(runtime, "dims", std::move(outputDims));
 +
@@ -325,7 +697,7 @@ index 00c1c79..dc7cd1e 100644
 +  }
 +  return outputTensorMap;
 +}
-+  
++
 +
  template <typename T>
  static Ort::Value createInputTensorT(OrtAllocator *ortAllocator, const std::vector<int64_t> &dims, NSData *buffer,
@@ -385,10 +757,53 @@ index 00c1c79..dc7cd1e 100644
  NSDictionary *OnnxTensorTypeToJsTensorTypeMap;
  
 diff --git a/node_modules/onnxruntime-react-native/lib/backend.ts b/node_modules/onnxruntime-react-native/lib/backend.ts
-index 4ebc364..5f211c1 100644
+index 4ebc364..71c91ce 100644
 --- a/node_modules/onnxruntime-react-native/lib/backend.ts
 +++ b/node_modules/onnxruntime-react-native/lib/backend.ts
-@@ -97,9 +97,17 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -48,25 +48,35 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+   #inferenceSession: Binding.InferenceSession;
+   #key: string;
+ 
++  #pathOrBuffer: string|Uint8Array;
++
+   inputNames: string[];
+   outputNames: string[];
+ 
+-  constructor(path: string) {
++  constructor(pathOrBuffer: string|Uint8Array) {
+     this.#inferenceSession = binding;
+-    this.#key = normalizePath(path);
++    this.#pathOrBuffer = pathOrBuffer;
++    this.#key = '';
++
+     this.inputNames = [];
+     this.outputNames = [];
+   }
+ 
+   async loadModel(options: InferenceSession.SessionOptions): Promise<void> {
+     try {
++      let results: Binding.ModelLoadInfoType;
+       // load a model
+-      const results: Binding.ModelLoadInfoType = await this.#inferenceSession.loadModel(this.#key, options);
+-      // resolve promise if onnxruntime session is successfully created
+-      if (results.key !== this.#key) {
+-        throw new Error('Session key is invalid');
++      if (typeof this.#pathOrBuffer === 'string') {
++        results = await this.#inferenceSession.loadModel(normalizePath(this.#pathOrBuffer), options);
++      } else {
++        if (!this.#inferenceSession.loadModelFromBase64EncodedBuffer) {
++          throw new Error('Native module method "loadModelFromBase64EncodedBuffer" is not defined');
++        }
++        const modelInBase64String = Buffer.from(this.#pathOrBuffer).toString('base64');
++        results = await this.#inferenceSession.loadModelFromBase64EncodedBuffer(modelInBase64String, options);
+       }
+-
++      // resolve promise if onnxruntime session is successfully created
++      this.#key = results.key;
+       this.inputNames = results.inputNames;
+       this.outputNames = results.outputNames;
+     } catch (e) {
+@@ -97,9 +107,18 @@ class OnnxruntimeSessionHandler implements SessionHandler {
          outputNames.push(name);
        }
      }
@@ -398,36 +813,38 @@ index 4ebc364..5f211c1 100644
 +    // const results: Binding.ReturnType = await this.#inferenceSession.run(this.#key, input, outputNames, options)
 +    console.log('input', performance.now() - t0)
 +    t0 = performance.now()
-+    const results: Binding.ReturnType = await global.__onnxruntimeInferenceRun(this.#key, input, outputNames, options);
++    const results: Binding.ReturnType = await global.__onnxruntimeSessionRun(this.#key, input, outputNames, options);
 +    console.log('run', performance.now() - t0)
 +    t0 = performance.now()
      const output = this.decodeReturnType(results);
 +    console.log('output', performance.now() - t0)
++    await new Promise(resolve => setTimeout(resolve, 1000))
 +    t0 = performance.now()
      return output;
    }
  
-@@ -114,11 +122,13 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -112,12 +131,14 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+         if (Array.isArray(feeds[key].data)) {
+           data = feeds[key].data as string[];
          } else {
-           // Base64-encode tensor data
+-          // Base64-encode tensor data
            const buffer = (feeds[key].data as SupportedTypedArray).buffer;
 -          data = Buffer.from(buffer, 0, buffer.byteLength).toString('base64');
++          // Base64-encode tensor data
 +          // data = Buffer.from(buffer, 0, buffer.byteLength).toString('base64');
 +          data = buffer
          }
  
          returnValue[key] = {
--          dims: feeds[key].dims,
 +          // dims: feeds[key].dims,
-+          dims: feeds[key].dims.map(dim => String(dim)),
+           dims: feeds[key].dims,
            type: feeds[key].type,
            data,
-         };
-@@ -130,18 +140,22 @@ class OnnxruntimeSessionHandler implements SessionHandler {
+@@ -130,13 +151,15 @@ class OnnxruntimeSessionHandler implements SessionHandler {
    decodeReturnType(results: Binding.ReturnType): SessionHandler.ReturnType {
      const returnValue: SessionHandler.ReturnType = {};
  
-+    let len = 0
++    console.log(results)
      for (const key in results) {
        if (Object.hasOwnProperty.call(results, key)) {
          let tensorData: Tensor.DataType;
@@ -439,22 +856,48 @@ index 4ebc364..5f211c1 100644
 +          const buffer: Buffer = Buffer.from(results[key].data)
            const typedArray = tensorTypeToTypedArray(results[key].type as Tensor.Type);
            tensorData = new typedArray(buffer.buffer, buffer.byteOffset, buffer.length / typedArray.BYTES_PER_ELEMENT);
-+          
-+          len += tensorData.length
          }
+@@ -156,9 +179,6 @@ class OnnxruntimeBackend implements Backend {
  
--        returnValue[key] = new Tensor(results[key].type as Tensor.Type, tensorData, results[key].dims);
-+        returnValue[key] = new Tensor(results[key].type as Tensor.Type, tensorData, results[key].dims.map(dim => Number(dim)));
-       }
-     }
- 
+   async createSessionHandler(pathOrBuffer: string|Uint8Array, options?: InferenceSession.SessionOptions):
+       Promise<SessionHandler> {
+-    if (typeof pathOrBuffer !== 'string') {
+-      throw new Error('Uint8Array is not supported');
+-    }
+     const handler = new OnnxruntimeSessionHandler(pathOrBuffer);
+     await handler.loadModel(options || {});
+     return handler;
 diff --git a/node_modules/onnxruntime-react-native/lib/binding.ts b/node_modules/onnxruntime-react-native/lib/binding.ts
-index afadbab..3282156 100644
+index afadbab..cb5d023 100644
 --- a/node_modules/onnxruntime-react-native/lib/binding.ts
 +++ b/node_modules/onnxruntime-react-native/lib/binding.ts
-@@ -71,3 +71,5 @@ export declare namespace Binding {
+@@ -64,6 +64,7 @@ export declare namespace Binding {
+ 
+   interface InferenceSession {
+     loadModel(modelPath: string, options: SessionOptions): Promise<ModelLoadInfoType>;
++    loadModelFromBase64EncodedBuffer?(buffer: string, options: SessionOptions): Promise<ModelLoadInfoType>;
+     run(key: string, feeds: FeedsType, fetches: FetchesType, options: RunOptions): Promise<ReturnType>;
+   }
+ }
+@@ -71,3 +72,5 @@ export declare namespace Binding {
  // export native binding
  const {Onnxruntime} = NativeModules;
  export const binding = Onnxruntime as Binding.InferenceSession;
 +
 +Onnxruntime.install();
+diff --git a/node_modules/onnxruntime-react-native/onnxruntime-react-native.podspec b/node_modules/onnxruntime-react-native/onnxruntime-react-native.podspec
+index aeb08b3..1f499fc 100644
+--- a/node_modules/onnxruntime-react-native/onnxruntime-react-native.podspec
++++ b/node_modules/onnxruntime-react-native/onnxruntime-react-native.podspec
+@@ -15,8 +15,10 @@ Pod::Spec.new do |spec|
+   spec.platforms            = { :ios => "12.4" }
+   spec.source               = { :git => "https://github.com/Microsoft/onnxruntime.git", :tag => "rel-#{spec.version}" }
+ 
+-  spec.source_files         = "ios/*.{h,mm}"
++  spec.source_files         = "ios/*.{h,mm}", "cpp/*.{h,cpp}"
+ 
+   spec.dependency "React-Core"
++  spec.dependency "React-callinvoker"
++  spec.dependency "ReactCommon/turbomodule/core"
+   spec.dependency "onnxruntime-c"
+ end
